@@ -2,9 +2,9 @@ name := "StopStreamingGracefully"
 
 version := "0.1"
 
-scalaVersion := "2.13.14"
+scalaVersion := "2.13.17"
 
-val sparkVersion = "3.5.3"
+val sparkVersion = "4.1.0"
 
 libraryDependencies ++= Seq(
   "org.apache.spark" %% "spark-core" % sparkVersion,
