@@ -58,11 +58,9 @@ object extensions {
       }
 
       var output = "success"
-      stopWatchFuture onComplete {
-        case Success(result : Boolean) => if (!result) {
-          output = s"failure: file not found."
-        }
-        case Failure(t) => output = s"failure: ${t.getMessage}."
+      stopWatchFuture.onComplete {
+        case Success(result: Boolean) => if (!result) output = "failure: file not found."
+        case Failure(t)               => output = s"failure: ${t.getMessage}."
       }
 
       self.awaitTermination()

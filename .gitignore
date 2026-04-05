@@ -1,4 +1,7 @@
 /.idea/
+.vscode/
 /target/
-/project/target/
+/project/
+.metals/
+.bloop/
 project/project/target
