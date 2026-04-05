@@ -1,4 +1,4 @@
-package com.abiratsis.spark.streaming.extensions.fs
+package io.github.stopstreaming.extensions.fs
 
 import com.databricks.dbutils_v1.DBUtilsHolder.dbutils
 

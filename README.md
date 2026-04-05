@@ -1,98 +1,392 @@
 # Stop Streaming Gracefully
 
-The purpose of this project is to stop a Spark Structured Streaming job through the file system. At the moment, Databricks DBFS and local file system are supported.
+A pluggable external termination API for Apache Spark Structured Streaming jobs.  
+No direct Spark context access required.
 
-The need arises from the fact that accessing the Spark context from a notebook in order to call the `stop` method on a `StreamingQuery` is often impractical or impossible in managed environments such as Databricks.
+---
 
-The solution is based on a file watcher (Scala `Future`) that runs asynchronously and keeps the streaming job running as long as a corresponding marker file exists in a predefined directory. When the file is deleted, the `stop` method is called, stopping the query gracefully. This allows you to control the lifetime of a streaming job via a shared directory without direct access to the Spark context.
+## Problem
 
-The implementation extends the built-in Spark class `StreamingQuery` with the method `awaitExternalTermination(streamStopDir, jobName, fsType)`.
+Spark's `StreamingQuery.stop()` requires direct access to the `SparkSession`, which is unavailable in many managed environments (Databricks notebooks, Azure Synapse, etc.).
+
+This library extends `StreamingQuery` with a single method:
+
+```scala
+query.awaitExternalTermination(config: StopConfig)
+```
+
+An async watcher (Scala `Future`) monitors a signal source in the background. When a termination signal is received, `stop()` is called automatically — without blocking the streaming thread and without needing a reference to the `SparkSession`.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TD
+    A["StreamingQuery.awaitExternalTermination(config)"]
+    A --> B["derive jobId from query.id"]
+    B --> C{config type}
+
+    C -->|Rest| D["RestWatcher(jobId, config)"]
+    C -->|FileSystemStopConfig| E["FileSystemWatcher(jobId, config)"]
+
+    D --> F["JDK HttpServer POST /stop/&lt;jobId&gt;"]
+    E --> G["poll loop stopDir/&lt;jobId&gt; exists?"]
+
+    F -->|signal received| H["query.stop()"]
+    G -->|file deleted| H
+    H --> I["awaitTermination()\nreturns"]
+```
+
+### Supported backends
+
+| Backend          | Signal source                         | Latency | Best for                   |
+| ---------------- | ------------------------------------- | ------- | -------------------------- |
+| **REST**         | `POST /stop/<jobId>` on the driver    | Low     | Orchestrated pipelines     |
+| **FileSystem**   | Marker file deletion (DBFS / local)   | Medium  | Databricks / simple setups |
+
+---
+
+## REST Watcher
+
+The driver starts a lightweight JDK HTTP server. An orchestrator — or any HTTP client — sends a `POST` to stop a specific job.
+
+### REST Watcher — flow
+
+```mermaid
+sequenceDiagram
+    participant O as Orchestrator
+    participant D as Spark Driver
+
+    D->>D: start() — register POST /stop/[query.id]
+    D->>D: awaitStopSignal() — poll loop starts
+
+    O->>D: POST /stop/[query.id]
+    D-->>O: 200 OK
+    D->>D: stopSignalReceived = true — poll loop exits
+    D->>D: query.stop()
+    D->>D: awaitTermination() returns
+```
+
+### Multi-job support
+
+Each streaming job registers a **unique path** (`/stop/<query.id>`), so multiple jobs can share the same port:
+
+```mermaid
+flowchart LR
+    O[Orchestrator]
+    O -->|POST /stop/id-of-A| A[Query A port 8558]
+    O -->|POST /stop/id-of-B| B[Query B port 8558]
+```
+
+This mirrors the FileSystem backend, where each job has its own marker file (`stopDir/<query.id>`).
+
+### REST Watcher — usage
+
+```scala
+import io.github.stopstreaming.extensions.StreamingQueryOps._
+import io.github.stopstreaming.extensions.conf.RestStopConfig
+
+val query = spark.readStream. ... .start()
+
+// jobId is derived automatically from query.id — no manual passing required
+val config = RestStopConfig(port = 8558)
+
+query.awaitExternalTermination(config)
+// registered path: POST /stop/<query.id>
+```
+
+The job identifier is **always derived from `query.id.toString`** inside `awaitExternalTermination`.
+
+Stop from the outside:
+
+```bash
+# query.id is a UUID printed in the Spark UI / logs
+curl -X POST http://<driver-host>:8558/stop/<query-id>
+```
+
+### Multiple jobs on the same driver
+
+```scala
+// Same port — each job gets its own path derived from its own query.id
+val cfg = RestStopConfig(port = 8558)
+
+queryA.awaitExternalTermination(cfg)   // POST /stop/<id-of-A>
+queryB.awaitExternalTermination(cfg)   // POST /stop/<id-of-B>
+```
+
+---
+
+## FileSystem Watcher
+
+A background thread polls a directory for the presence of a marker file named after the job. When the file is deleted, the query is stopped.
+
+### FileSystem Watcher — flow
+
+```mermaid
+sequenceDiagram
+    participant E as External Process
+    participant D as Spark Driver
+
+    D->>D: start() — create stopDir/[query.id]
+    D->>D: awaitStopSignal() — poll loop starts
+
+    loop while file exists
+        D->>D: Thread.sleep(100ms)
+        D->>D: check stopDir/[query.id]
+    end
+
+    E->>E: rm stopDir/[query.id]
+    D->>D: file gone — poll loop exits
+    D->>D: query.stop()
+    D->>D: awaitTermination() returns
+```
+
+### Supported file systems
+
+| `fsType`                  | Environment                            |
+| ------------------------- | -------------------------------------- |
+| `FsType.LocalFileSystem`  | Local machine, any Linux/macOS path    |
+| `FsType.DBFS`             | Databricks File System (`dbutils.fs`)  |
+
+### FileSystem Watcher — usage
+
+```scala
+import io.github.stopstreaming.extensions.StreamingQueryOps._
+import io.github.stopstreaming.extensions.conf.{FileSystemStopConfig, FsType}
+
+val query = spark.readStream. ... .start()
+
+// jobName is derived automatically from query.id — no manual passing required
+val config = FileSystemStopConfig(
+  stopDir = "/tmp/streaming-stop",
+  fsType  = FsType.LocalFileSystem
+)
+
+query.awaitExternalTermination(config)
+// marker file: /tmp/streaming-stop/<query.id>
+```
+
+The job identifier is **always derived from `query.id.toString`** inside `awaitExternalTermination`.
+
+Stop from a local shell:
+
+```bash
+# query.id is a UUID printed in the Spark UI / logs
+rm /tmp/streaming-stop/<query-id>
+```
+
+Stop from a Databricks notebook:
+
+```scala
+%fs rm /mnt/streaming-stop/<query-id>
+```
+
+---
+
+## Job ID — no configuration required
+
+Both backends derive the job identifier directly from `StreamingQuery.id` at
+runtime — it is **not** part of `StopConfig`.
+
+```text
+REST        POST /stop/<query.id>        — path constructed at call time
+FileSystem  stopDir/<query.id>           — marker file name derived at call time
+```
+
+The job ID is only known after `query.start()` returns. By deriving it
+internally from `self.id.toString`, `awaitExternalTermination` always targets
+the correct query — misconfiguration is impossible by design.
+
+
+## Loading config from file
+
+Both backends can be configured via HOCON (`src/main/resources/application.conf`):
+
+```hocon
+stopstreaming {
+  backend = "rest"          # or "filesystem"
+
+  rest {
+    host      = "0.0.0.0"
+    port      = 8558
+    stop-path = "/stop"
+  }
+
+  filesystem {
+    stop-dir = "/tmp/stopstreaming"
+    fs-type  = "LocalFileSystem"    # LocalFileSystem | DBFS
+  }
+}
+```
+
+> `job-id` and `job-name` are **not** config fields — they are derived
+> automatically from `query.id` at runtime.
+
+```scala
+import io.github.stopstreaming.extensions.conf.StopConfigLoader
+import io.github.stopstreaming.extensions.StreamingQueryOps._
+
+val config = StopConfigLoader.load()          // reads application.conf
+query.awaitExternalTermination(config)
+```
+
+---
 
 ## Requirements
 
-- Java 17+
-- Scala 2.13
-- Apache Spark 3.5.x
-- SBT 1.9+
+| Dependency       | Version |
+| ---------------- | ------- |
+| Java             | 17+     |
+| Scala            | 2.13    |
+| Apache Spark     | 4.1.x   |
+| SBT              | 1.9+    |
+| Typesafe Config  | 1.4.3   |
+
+The REST backend uses the JDK built-in `HttpServer` and requires the following JVM flag:
+
+```text
+--add-exports=jdk.httpserver/com.sun.net.httpserver=ALL-UNNAMED
+```
+
+This is already configured in `build.sbt`.
+
+---
 
 ## Build
 
-### Compile
-
 ```bash
+# Compile
 sbt compile
-```
 
-### Run tests
-
-```bash
+# Run tests
 sbt test
-```
 
-### Package a JAR
-
-```bash
+# Thin JAR (no dependencies bundled)
 sbt package
+
+# Fat JAR — include all dependencies (recommended for deployment)
+# Requires sbt-assembly in project/plugins.sbt (see below)
+sbt assembly
 ```
 
-The JAR is produced at `target/scala-2.13/stopstreaminggracefully_2.13-0.1.jar`.
+The thin JAR is produced at `target/scala-2.13/stopstreaminggracefully_2.13-0.1.jar`.  
+The fat JAR is produced at `target/scala-2.13/stopstreaminggracefully-assembly-0.1.jar`.
 
-### Create a fat JAR (assembly)
-
-If you need a self-contained JAR with all dependencies included, add the [sbt-assembly](https://github.com/sbt/sbt-assembly) plugin to `project/plugins.sbt`:
+To enable fat JAR builds, add to `project/plugins.sbt`:
 
 ```scala
 addSbtPlugin("com.eed3si9n" % "sbt-assembly" % "2.2.0")
 ```
 
-Then run:
+---
+
+## Deployment
+
+### Local SBT project
+
+Copy the JAR into your project's `lib/` directory — SBT picks it up automatically as an unmanaged dependency:
+
+```text
+your-project/
+└── lib/
+    └── stopstreaminggracefully_2.13-0.1.jar
+```
+
+No `build.sbt` change needed. Rebuild your project with `sbt compile`.
+
+Alternatively, publish to your local Ivy cache and reference it as a managed dependency:
 
 ```bash
-sbt assembly
+# in this repo
+sbt publishLocal
 ```
-
-## Usage
-
-Write your streaming program and call `awaitExternalTermination` instead of `awaitTermination`, passing the following arguments:
-
-- `streamStopDir` — the directory to watch for the marker file
-- `jobName` — a unique identifier for the job, used as the marker file name inside `streamStopDir`
-- `fsType` — one of `FileSystemType.DBFS` or `FileSystemType.LocalFileSystem`
-
-To stop the job, delete the marker file. From a Databricks notebook or CLI:
 
 ```scala
-%fs rm -r your_path
+// your project's build.sbt
+libraryDependencies += "io.github.stopstreaming" %% "stopstreaminggracefully" % "0.1"
 ```
 
-Or from a local shell:
+---
+
+### spark-submit (local Spark / YARN / Kubernetes)
+
+Use the **fat JAR** so all transitive dependencies (Typesafe Config, etc.) are included:
 
 ```bash
-rm /your/stop/dir/<job-id>
+spark-submit \
+  --jars /path/to/stopstreaminggracefully-assembly-0.1.jar \
+  --conf "spark.driver.extraJavaOptions=--add-exports=jdk.httpserver/com.sun.net.httpserver=ALL-UNNAMED" \
+  --class com.example.MyStreamingApp \
+  my-app.jar
 ```
 
-## Scala example
+If your application JAR is already a fat JAR that includes this library, `--jars` is not needed.
+
+---
+
+### Databricks cluster
+
+#### Step 1 — upload the JAR
+
+Via the Databricks UI:  
+`Compute → <your cluster> → Libraries → Install new → Upload → JAR`  
+Upload `stopstreaminggracefully-assembly-0.1.jar`.
+
+Or via `dbutils` in a notebook:
 
 ```scala
-import com.abiratsis.spark.streaming.extensions.extensions._
-
-val streamingQuery = spark
-  .readStream
-  .csv("some_path")
-
-val sq = streamingQuery.writeStream
-  .outputMode("append")
-  .format("csv")
-  .option("path", "some_path")
-  .start()
-
-val stopStreamingDir = "some_dbfs_path"
-
-sq.awaitExternalTermination(stopStreamingDir, sq.id.toString, FileSystemType.DBFS)
+dbutils.fs.cp(
+  "file:///path/to/stopstreaminggracefully-assembly-0.1.jar",
+  "dbfs:/FileStore/jars/stopstreaminggracefully-assembly-0.1.jar"
+)
 ```
 
-For a local file system:
+Then install from DBFS:  
+`Compute → <your cluster> → Libraries → Install new → DBFS → dbfs:/FileStore/jars/stopstreaminggracefully-assembly-0.1.jar`
+
+#### Step 2 — add the JVM export flag
+
+In the cluster's Spark configuration (`Advanced options → Spark config`):
+
+```text
+spark.driver.extraJavaOptions --add-exports=jdk.httpserver/com.sun.net.httpserver=ALL-UNNAMED
+```
+
+#### Step 3 — use in a notebook
 
 ```scala
-sq.awaitExternalTermination("/tmp/stop_streaming/", sq.id.toString, FileSystemType.LocalFileSystem)
+import io.github.stopstreaming.extensions.StreamingQueryOps._
+import io.github.stopstreaming.extensions.conf.{FileSystemStopConfig, FsType}
+
+val query = spark.readStream. ... .start()
+
+val config = FileSystemStopConfig(
+  stopDir = "dbfs:/tmp/streaming-stop",
+  fsType  = FsType.DBFS
+)
+
+query.awaitExternalTermination(config)
+// marker file: dbfs:/tmp/streaming-stop/<query.id>
+// delete it from another cell or notebook to stop the query
+```
+
+---
+
+## Project structure
+
+```text
+src/main/scala/io/github/stopstreaming/extensions/
+├── StreamingQueryOps.scala          extension method on StreamingQuery
+├── StopSignalWatcher.scala          common trait for all backends
+├── conf/
+│   ├── StopConfig.scala             sealed trait + RestStopConfig + FileSystemStopConfig
+│   └── StopConfigLoader.scala       loads config from application.conf (HOCON)
+├── fs/
+│   ├── FileSystemWatcher.scala      polls for marker file deletion
+│   ├── FileSystemWrapper.scala      trait
+│   ├── LocalFileSystemWrapper.scala local FS implementation
+│   └── DbfsWrapper.scala            Databricks FS implementation
+└── rest/
+    └── RestWatcher.scala            embedded JDK HTTP server
 ```

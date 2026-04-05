@@ -1,4 +1,4 @@
-package com.abiratsis.spark.streaming.extensions.fs
+package io.github.stopstreaming.extensions.fs
 
 class LocalFileSystemWrapper(val stopDir: String, val targetFile: String) extends FileSystemWrapper {
 
