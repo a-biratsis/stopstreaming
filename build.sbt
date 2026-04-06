@@ -12,14 +12,20 @@ libraryDependencies ++= Seq(
   "org.apache.spark" %% "spark-hive" % sparkVersion,
   "org.scalatest"    %% "scalatest"  % "3.2.19" % Test,
   "org.scalactic"    %% "scalactic"  % "3.2.19",
+  "com.typesafe"     %  "config"     % "1.4.3",
   "com.databricks"   %  "dbutils-api_2.12" % "0.0.5" % Provided excludeAll(
     ExclusionRule(organization = "org.apache.spark")
   )
 )
 
+// Expose JDK's built-in HttpServer (jdk.httpserver module) to user code.
+// Required by RestWatcher at both compile-time and run-time.
+scalacOptions += "-J--add-exports=jdk.httpserver/com.sun.net.httpserver=ALL-UNNAMED"
+
 Test / logBuffered := false
 Test / fork        := true
 Test / javaOptions ++= Seq(
+  "--add-exports=jdk.httpserver/com.sun.net.httpserver=ALL-UNNAMED",
   "--add-opens=java.base/java.lang=ALL-UNNAMED",
   "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED",
   "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED",

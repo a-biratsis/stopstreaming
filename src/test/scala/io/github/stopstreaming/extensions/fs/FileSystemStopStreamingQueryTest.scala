@@ -1,9 +1,10 @@
-package com.abiratsis.spark.streaming.extensions
+package io.github.stopstreaming.extensions.fs
 
 import java.io.File
 import java.nio.file.{Files, Paths, StandardCopyOption}
 
-import com.abiratsis.spark.streaming.extensions.extensions._
+import io.github.stopstreaming.extensions.StreamingQueryOps._
+import io.github.stopstreaming.extensions.conf.FileSystemStopConfig
 import org.apache.spark.sql.{Encoders, SparkSession}
 import org.scalatest.flatspec.AnyFlatSpec
 import scala.reflect.io.Directory
@@ -25,8 +26,12 @@ class FileSystemStopStreamingQueryTest extends AnyFlatSpec {
 
   import spark.implicits._
 
-  private val tmpPath: String      = "/tmp/stop_streaming/"
+  private val tmpPath: String       = "/tmp/stop_streaming/"
   private val sampleDataDir: String = s"${tmpPath}data"
+
+  // Separate from tmpPath so cleanUpDir() on the marker dir
+  // does not delete the data/output directories Spark is still using.
+  private val stopMarkerDir: String = "/tmp/stop_streaming_markers/"
 
   def cleanUpDir(path: String): Unit = {
     val directory = new Directory(new File(path))
@@ -63,14 +68,13 @@ class FileSystemStopStreamingQueryTest extends AnyFlatSpec {
       .option("path", tmpPath)
       .start()
 
-    val stopStreamingDir  = "/tmp/stop_streaming/"
-    val stopStreamingPath = s"$stopStreamingDir/${q.id.toString}"
+    val stopStreamingPath = s"$stopMarkerDir/${q.id.toString}"
 
     while (q.isActive && q.recentProgress.length <= 0) {
       Thread.sleep(100)
     }
 
-    cleanUpDir(stopStreamingDir)
+    cleanUpDir(stopMarkerDir)
 
     val stopFile = new File(stopStreamingPath)
 
@@ -87,7 +91,8 @@ class FileSystemStopStreamingQueryTest extends AnyFlatSpec {
       case Failure(_) => fail(s"failed to remove: $stopStreamingPath.")
     }
 
-    q.awaitExternalTermination(stopStreamingDir, q.id.toString, FileSystemType.LocalFileSystem)
+    val config = FileSystemStopConfig(stopDir = stopMarkerDir)
+    q.awaitExternalTermination(config)
 
     assert(q.isActive == false)
   }
