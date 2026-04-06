@@ -10,20 +10,25 @@ import java.net.{HttpURLConnection, URL}
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent._
 import scala.reflect.io.Directory
+import scala.util.Using
 
 class RestWatcherTest extends AnyFunSuite {
 
   val testPort = 18558  // non-default port to avoid clashes in CI
 
-  def sendPost(port: Int, path: String): Int = {
+  def sendPost(port: Int, path: String): Int =
+    sendPostWithBody(port, path)._1
+
+  def sendPostWithBody(port: Int, path: String): (Int, String) = {
     val url  = new URL(s"http://127.0.0.1:$port$path")
     val conn = url.openConnection().asInstanceOf[HttpURLConnection]
     conn.setRequestMethod("POST")
     conn.setDoOutput(true)
     conn.connect()
     val code = conn.getResponseCode
+    val body = scala.io.Source.fromInputStream(conn.getInputStream).mkString
     conn.disconnect()
-    code
+    (code, body)
   }
 
   def sendGet(port: Int, path: String): Int = {
@@ -50,7 +55,9 @@ class RestWatcherTest extends AnyFunSuite {
     val signal = watcher.awaitStopSignal()
     Thread.sleep(200)
 
-    assert(sendPost(testPort, "/stop/job-1") == 200)
+    val (code, body) = sendPostWithBody(testPort, "/stop/job-1")
+    assert(code == 200)
+    assert(body == "Stop signal received for job job-1")
 
     val stopped = Await.result(signal, scala.concurrent.duration.Duration(5, "seconds"))
     assert(stopped)
@@ -99,18 +106,18 @@ class RestWatcherTest extends AnyFunSuite {
   }
 
   // -------------------------------------------------------------------------
-  // Multi-job: two watchers, each stopped independently by job ID
+  // Multi-job: two watchers sharing the same port, stopped independently
   // -------------------------------------------------------------------------
 
-  test("two watchers on different ports stop independently by jobId") {
-    val cfgA = RestStopConfig(host = "127.0.0.1", port = testPort + 4)
-    val cfgB = RestStopConfig(host = "127.0.0.1", port = testPort + 5)
+  test("two watchers on the same port share the server and stop independently") {
+    val sharedPort = testPort + 4
+    val cfg = RestStopConfig(host = "127.0.0.1", port = sharedPort)
 
-    val watcherA = new RestWatcher(cfgA, "job-A")
-    val watcherB = new RestWatcher(cfgB, "job-B")
+    val watcherA = new RestWatcher(cfg, "job-A")
+    val watcherB = new RestWatcher(cfg, "job-B")
 
     watcherA.start()
-    watcherB.start()
+    watcherB.start()   // must NOT throw BindException — shares the server
 
     val signalA = watcherA.awaitStopSignal()
     val signalB = watcherB.awaitStopSignal()
@@ -118,18 +125,22 @@ class RestWatcherTest extends AnyFunSuite {
     Thread.sleep(200)
 
     // Stop only job A — B must remain active
-    assert(sendPost(testPort + 4, "/stop/job-A") == 200)
+    assert(sendPost(sharedPort, "/stop/job-A") == 200)
     val resultA = Await.result(signalA, scala.concurrent.duration.Duration(5, "seconds"))
     assert(resultA)
     assert(!signalB.isCompleted)
 
+    // POSTing to A again must NOT affect B
+    sendPost(sharedPort, "/stop/job-A")
+    assert(!signalB.isCompleted)
+
     // Now stop job B
-    assert(sendPost(testPort + 5, "/stop/job-B") == 200)
+    assert(sendPost(sharedPort, "/stop/job-B") == 200)
     val resultB = Await.result(signalB, scala.concurrent.duration.Duration(5, "seconds"))
     assert(resultB)
 
     watcherA.shutdown()
-    watcherB.shutdown()
+    watcherB.shutdown()  // server is stopped only after both release
   }
 
   // -------------------------------------------------------------------------
@@ -177,11 +188,73 @@ class RestWatcherTest extends AnyFunSuite {
     Directory(new java.io.File("/tmp/rest_watcher_test")).deleteRecursively()
   }
 
+  test("two real streaming queries stopped independently via shared REST port") {
+    val spark = SparkSession.builder()
+      .master("local[4]")
+      .appName("RestWatcherMultiQueryTest")
+      .getOrCreate()
+
+    val schema = org.apache.spark.sql.types.StructType(Seq(
+      org.apache.spark.sql.types.StructField("value", org.apache.spark.sql.types.StringType)
+    ))
+
+    val inputA  = "/tmp/rest_multi_test/input_a"
+    val inputB  = "/tmp/rest_multi_test/input_b"
+    val outputA = "/tmp/rest_multi_test/output_a"
+    val outputB = "/tmp/rest_multi_test/output_b"
+
+    writeTestCsv(inputA)
+    writeTestCsv(inputB)
+
+    val sharedPort = testPort + 7
+    val config = RestStopConfig(host = "127.0.0.1", port = sharedPort)
+
+    val queryA: StreamingQuery = spark.readStream
+      .schema(schema).csv(inputA)
+      .writeStream.format("csv")
+      .option("path", outputA)
+      .option("checkpointLocation", s"$outputA/_checkpoint")
+      .start()
+
+    val queryB: StreamingQuery = spark.readStream
+      .schema(schema).csv(inputB)
+      .writeStream.format("csv")
+      .option("path", outputB)
+      .option("checkpointLocation", s"$outputB/_checkpoint")
+      .start()
+
+    // Both queries must be distinct
+    assert(queryA.id != queryB.id)
+
+    queryA.awaitTermination(1000)
+    queryB.awaitTermination(1000)
+
+    // Run both awaitExternalTermination calls concurrently — they block until stopped
+    val futureA = Future { queryA.awaitExternalTermination(config) }
+    val futureB = Future { queryB.awaitExternalTermination(config) }
+
+    Thread.sleep(500)
+
+    // Stop query A only — query B must still be active
+    assert(sendPost(sharedPort, s"/stop/${queryA.id}") == 200)
+    Await.result(futureA, scala.concurrent.duration.Duration(10, "seconds"))
+    assert(!queryA.isActive)
+    assert(queryB.isActive)
+
+    // Now stop query B
+    assert(sendPost(sharedPort, s"/stop/${queryB.id}") == 200)
+    Await.result(futureB, scala.concurrent.duration.Duration(10, "seconds"))
+    assert(!queryB.isActive)
+
+    spark.stop()
+    Directory(new java.io.File("/tmp/rest_multi_test")).deleteRecursively()
+  }
+
   private def writeTestCsv(dir: String): Unit = {
     new java.io.File(dir).mkdirs()
-    val pw = new java.io.PrintWriter(s"$dir/data.csv")
-    pw.println("hello")
-    pw.println("world")
-    pw.close()
+    Using(new java.io.PrintWriter(s"$dir/data.csv")) { pw =>
+      pw.println("hello")
+      pw.println("world")
+    }
   }
 }

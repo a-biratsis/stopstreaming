@@ -28,14 +28,14 @@ flowchart TD
     B --> C{config type}
 
     C -->|Rest| D["RestWatcher(jobId, config)"]
-    C -->|FileSystemStopConfig| E["FileSystemWatcher(jobId, config)"]
+    C -->|FileSystem| E["FileSystemWatcher(jobId, config)"]
 
-    D --> F["JDK HttpServer POST /stop/&lt;jobId&gt;"]
-    E --> G["poll loop stopDir/&lt;jobId&gt; exists?"]
+    D --> F["SharedHttpServer POST /stop/[jobId]"]
+    E --> G["poll loop stopDir/[jobId] exists?"]
 
     F -->|signal received| H["query.stop()"]
     G -->|file deleted| H
-    H --> I["awaitTermination()\nreturns"]
+    H --> I["awaitTermination() returns"]
 ```
 
 ### Supported backends
@@ -70,14 +70,19 @@ sequenceDiagram
 
 ### Multi-job support
 
-Each streaming job registers a **unique path** (`/stop/<query.id>`), so multiple jobs can share the same port:
+Multiple streaming jobs on the same driver can share **the same port**. The library automatically manages a single `HttpServer` per port — no extra configuration needed. Each job gets a unique context path derived from its own `query.id`, so stop signals are always routed to the correct query:
 
 ```mermaid
 flowchart LR
     O[Orchestrator]
-    O -->|POST /stop/id-of-A| A[Query A port 8558]
-    O -->|POST /stop/id-of-B| B[Query B port 8558]
+    S["SharedHttpServer :8558\nauto-managed per port"]
+    O -->|POST /stop/id-of-A| S
+    O -->|POST /stop/id-of-B| S
+    S -->|/stop/id-of-A| A[Query A]
+    S -->|/stop/id-of-B| B[Query B]
 ```
+
+The server starts when the first watcher on that port calls `start()` and is stopped only when the last watcher calls `shutdown()`.
 
 This mirrors the FileSystem backend, where each job has its own marker file (`stopDir/<query.id>`).
 
@@ -89,12 +94,20 @@ import io.github.stopstreaming.extensions.conf.RestStopConfig
 
 val query = spark.readStream. ... .start()
 
-// jobId is derived automatically from query.id — no manual passing required
-val config = RestStopConfig(port = 8558)
+// Default config — binds to all interfaces on port 8558, path /stop
+val config = RestStopConfig()
 
 query.awaitExternalTermination(config)
 // registered path: POST /stop/<query.id>
 ```
+
+**Default values:**
+
+| Parameter  | Default     | Description                                      |
+| ---------- | ----------- | ------------------------------------------------ |
+| `host`     | `"0.0.0.0"` | Binds to all network interfaces                  |
+| `port`     | `8558`      | HTTP port                                        |
+| `stopPath` | `"/stop"`   | Base path — effective path is `/stop/<query.id>` |
 
 The job identifier is **always derived from `query.id.toString`** inside `awaitExternalTermination`.
 
@@ -184,21 +197,6 @@ Stop from a Databricks notebook:
 
 ---
 
-## Job ID — no configuration required
-
-Both backends derive the job identifier directly from `StreamingQuery.id` at
-runtime — it is **not** part of `StopConfig`.
-
-```text
-REST        POST /stop/<query.id>        — path constructed at call time
-FileSystem  stopDir/<query.id>           — marker file name derived at call time
-```
-
-The job ID is only known after `query.start()` returns. By deriving it
-internally from `self.id.toString`, `awaitExternalTermination` always targets
-the correct query — misconfiguration is impossible by design.
-
-
 ## Loading config from file
 
 Both backends can be configured via HOCON (`src/main/resources/application.conf`):
@@ -219,9 +217,6 @@ stopstreaming {
   }
 }
 ```
-
-> `job-id` and `job-name` are **not** config fields — they are derived
-> automatically from `query.id` at runtime.
 
 ```scala
 import io.github.stopstreaming.extensions.conf.StopConfigLoader

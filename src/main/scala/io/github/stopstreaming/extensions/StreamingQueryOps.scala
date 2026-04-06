@@ -35,9 +35,11 @@ object StreamingQueryOps {
 
       val jobId = self.id.toString
 
+      val spark = self.sparkSession
+
       val watcher: StopSignalWatcher = config match {
-        case c: RestStopConfig       => new RestWatcher(c, jobId)
-        case c: FileSystemStopConfig => new FileSystemWatcher(c, jobId, () => self.isActive)
+        case c: RestStopConfig       => new RestWatcher(c, jobId, spark)
+        case c: FileSystemStopConfig => new FileSystemWatcher(c, jobId, spark)
       }
 
       watcher.start()
